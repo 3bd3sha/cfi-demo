@@ -1,10 +1,11 @@
-version: '3.8'
-
 # CFI Trading Platform - Local Docker Demo
 # This runs the complete stack locally for testing and demonstration
 
 services:
-# MONITORING STACK
+  # ==========================================================================
+  # MONITORING STACK
+  # ==========================================================================
+  
   # Prometheus - Metrics collection
   prometheus:
     image: prom/prometheus:latest
@@ -28,13 +29,12 @@ services:
     image: grafana/grafana:latest
     container_name: cfi-grafana
     ports:
-      - "3000:3000"
+      - "4500:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./grafana:/etc/grafana/provisioning
     networks:
       - cfi-network
     restart: unless-stopped
@@ -55,60 +55,10 @@ services:
       - cfi-network
     restart: unless-stopped
   
-
-# TRADING SERVICES
-
-  # Trading API - Stable version
-  trading-api-stable:
-    build:
-      context: ./app
-      dockerfile: Dockerfile
-    container_name: cfi-trading-api-stable
-    ports:
-      - "8080:8080"
-    environment:
-      - VERSION=stable
-      - NODE_ENV=production
-      - PROMETHEUS_ENABLED=true
-    labels:
-      - "version=stable"
-      - "prometheus.scrape=true"
-      - "prometheus.port=8080"
-      - "prometheus.path=/metrics"
-    networks:
-      - cfi-network
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+  # ==========================================================================
+  # SAMPLE APPLICATION (For generating metrics)
+  # ==========================================================================
   
-  # Trading API - Canary version (for testing deployments)
-  trading-api-canary:
-    build:
-      context: ./app
-      dockerfile: Dockerfile
-    container_name: cfi-trading-api-canary
-    ports:
-      - "8081:8080"
-    environment:
-      - VERSION=canary
-      - NODE_ENV=production
-      - PROMETHEUS_ENABLED=true
-    labels:
-      - "version=canary"
-      - "prometheus.scrape=true"
-      - "prometheus.port=8080"
-      - "prometheus.path=/metrics"
-    networks:
-      - cfi-network
-    restart: unless-stopped
-    profiles:
-      - canary  # Only start when explicitly requested
-  
-
-# SAMPLE APPLICATION (For generating metrics)
   sample-app:
     image: python:3.11-slim
     container_name: cfi-sample-app
@@ -124,27 +74,10 @@ services:
       - cfi-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
-
-
-# LOAD GENERATOR (Optional - for testing)
-  load-generator:
-    image: williamyeh/hey:latest
-    container_name: cfi-load-generator
-    command: >
-      sh -c "while true; do
-        hey -z 10s -c 10 -q 5 http://sample-app:8000/ ;
-        sleep 5 ;
-      done"
-    networks:
-      - cfi-network
-    profiles:
-      - load  # Only start when explicitly requested
-    depends_on:
-      - sample-app
 
 networks:
   cfi-network:
