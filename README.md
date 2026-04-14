@@ -12,7 +12,7 @@
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/yourusername/cfi-devops-demo
+git clone https://github.com/3bd3sha/cfi-demo
 cd cfi-devops-demo
 
 # 2. Deploy monitoring stack
