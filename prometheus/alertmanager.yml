@@ -1,0 +1,43 @@
+global:
+  resolve_timeout: 5m
+
+# Alert routing configuration
+route:
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 12h
+  receiver: 'default'
+  
+  routes:
+    # Critical alerts
+    - match:
+        severity: critical
+      receiver: 'critical-alerts'
+      continue: true
+    
+    # Warning alerts
+    - match:
+        severity: warning
+      receiver: 'warning-alerts'
+
+# Receivers (notification channels)
+receivers:
+  - name: 'default'
+    # No notifications for default (info level)
+  
+  - name: 'critical-alerts'
+    # In production, this would page via PagerDuty
+    # For local demo, just log
+  
+  - name: 'warning-alerts'
+    # In production, this would send to Slack
+    # For local demo, just log
+
+# Inhibition rules (suppress certain alerts)
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'cluster', 'service']

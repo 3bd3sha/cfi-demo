@@ -1,0 +1,246 @@
+# Alert Rules for CFI Trading Platform
+# Designed for high-stakes financial trading environment
+# SLO: 99.99% availability, P95 latency < 200ms, settlement < 30s
+
+groups:
+  # ==========================================================================
+  # CRITICAL TRADING ALERTS (Page immediately)
+  # ==========================================================================
+  
+  - name: trading_critical
+    interval: 30s
+    rules:
+      # Order execution success rate below SLO
+      - alert: OrderSuccessRateBelowSLO
+        expr: |
+          (
+            sum(rate(orders_total{status="success"}[5m])) /
+            sum(rate(orders_total[5m]))
+          ) * 100 < 99.99
+        for: 2m
+        labels:
+          severity: critical
+          team: trading
+          runbook: https://wiki.cfi.com/runbooks/order-success-rate
+        annotations:
+          summary: "Order success rate below 99.99% SLO"
+          description: "Current success rate: {{ $value | humanizePercentage }}. SLO requires 99.99%."
+          impact: "Direct revenue loss. Customers cannot place orders successfully."
+          action: "1. Check trading-api pods health. 2. Check database connectivity. 3. Review recent deployments."
+
+      # Trade settlement delayed
+      - alert: TradeSettlementDelayed
+        expr: |
+          histogram_quantile(0.95,
+            rate(settlement_duration_seconds_bucket[5m])
+          ) > 30
+        for: 2m
+        labels:
+          severity: critical
+          team: trading
+          runbook: https://wiki.cfi.com/runbooks/settlement-delay
+        annotations:
+          summary: "Trade settlement P95 exceeds 30 seconds"
+          description: "Current P95 settlement time: {{ $value | humanizeDuration }}. SLO requires < 30s."
+          impact: "Regulatory compliance risk. Customer dissatisfaction."
+          action: "1. Check settlement service pods. 2. Check clearing house API. 3. Scale up if needed."
+
+      # Market data feed offline
+      - alert: MarketDataFeedOffline
+        expr: up{job="market-data"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          team: trading
+          runbook: https://wiki.cfi.com/runbooks/market-data-offline
+        annotations:
+          summary: "Market data feed is offline"
+          description: "Market data service {{ $labels.pod }} is down."
+          impact: "Trading halted. Cannot display current prices. Orders cannot be executed."
+          action: "1. Check market-data pods. 2. Failover to backup feed. 3. Contact feed provider."
+
+      # Market data lag exceeds threshold
+      - alert: MarketDataLagHigh
+        expr: (time() - market_data_last_update_timestamp) > 1
+        for: 30s
+        labels:
+          severity: critical
+          team: trading
+        annotations:
+          summary: "Market data lag exceeds 1 second"
+          description: "Last market data update was {{ $value | humanizeDuration }} ago."
+          impact: "Stale prices. Risk of executing trades at incorrect prices."
+          action: "1. Check market data feed connection. 2. Check network latency. 3. Restart feed if needed."
+
+      # Payment processing failures
+      - alert: PaymentProcessingFailures
+        expr: |
+          (
+            sum(rate(payments_total{status="failed"}[5m])) /
+            sum(rate(payments_total[5m]))
+          ) * 100 > 0.1
+        for: 2m
+        labels:
+          severity: critical
+          team: payments
+        annotations:
+          summary: "Payment processing error rate > 0.1%"
+          description: "Current failure rate: {{ $value | humanizePercentage }}"
+          impact: "Customers cannot fund accounts or withdraw. Revenue impact."
+          action: "1. Check payment-service logs. 2. Check payment gateway status. 3. Enable retry queue."
+
+  # ==========================================================================
+  # WARNING ALERTS (Slack notification)
+  # ==========================================================================
+  
+  - name: trading_warnings
+    interval: 1m
+    rules:
+      # API latency increasing
+      - alert: APILatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            rate(http_request_duration_seconds_bucket{job="trading-api"}[5m])
+          ) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "API P95 latency exceeds 200ms"
+          description: "Current P95: {{ $value | humanizeDuration }}. Target: < 200ms"
+          action: "Investigate slow endpoints. May need to scale up."
+
+      # Database connection pool high
+      - alert: DatabaseConnectionPoolHigh
+        expr: |
+          (
+            database_connections_active /
+            database_connections_max
+          ) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Database connection pool at {{ $value | humanizePercentage }}"
+          description: "Connection pool approaching limit. May cause connection errors."
+          action: "1. Check for connection leaks. 2. Consider increasing pool size. 3. Review slow queries."
+
+      # Pod restart rate increasing
+      - alert: PodRestartRateHigh
+        expr: rate(kube_pod_container_status_restarts_total{namespace="trading"}[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Pod {{ $labels.pod }} restarting frequently"
+          description: "Pod has restarted {{ $value }} times in last 15 minutes."
+          action: "1. Check pod logs. 2. Check resource limits (OOMKilled?). 3. Review recent deployments."
+
+      # Certificate expiring soon
+      - alert: CertificateExpiringSoon
+        expr: (ssl_certificate_expiry_timestamp - time()) / 86400 < 14
+        for: 1h
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "SSL certificate expires in {{ $value | humanizeDuration }}"
+          description: "Certificate for {{ $labels.domain }} expires soon."
+          action: "Renew certificate before expiration to avoid service disruption."
+
+  # ==========================================================================
+  # INFRASTRUCTURE ALERTS
+  # ==========================================================================
+  
+  - name: infrastructure
+    interval: 1m
+    rules:
+      # Node CPU high
+      - alert: NodeCPUHigh
+        expr: |
+          100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (node) * 100) > 80
+        for: 10m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Node {{ $labels.node }} CPU usage > 80%"
+          description: "Current CPU: {{ $value | humanizePercentage }}"
+          action: "1. Check which pods are consuming CPU. 2. Scale up if needed. 3. Add node if cluster-wide."
+
+      # Node memory high
+      - alert: NodeMemoryHigh
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Node {{ $labels.node }} memory usage > 85%"
+          description: "Current memory: {{ $value | humanizePercentage }}"
+          action: "1. Check for memory leaks. 2. Evict non-critical pods. 3. Add node if needed."
+
+      # Disk space low
+      - alert: DiskSpaceLow
+        expr: |
+          (
+            node_filesystem_size_bytes{mountpoint="/"} -
+            node_filesystem_free_bytes{mountpoint="/"}
+          ) / node_filesystem_size_bytes{mountpoint="/"} * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Node {{ $labels.node }} disk usage > 85%"
+          description: "Current disk usage: {{ $value | humanizePercentage }}"
+          action: "1. Clean up old logs. 2. Remove unused Docker images. 3. Expand disk if needed."
+
+  # ==========================================================================
+  # DEPLOYMENT MONITORING (For CI/CD integration)
+  # ==========================================================================
+  
+  - name: deployment_health
+    interval: 30s
+    rules:
+      # Canary error rate higher than stable
+      - alert: CanaryErrorRateHigh
+        expr: |
+          (
+            sum(rate(http_requests_total{version="canary",status=~"5.."}[5m])) /
+            sum(rate(http_requests_total{version="canary"}[5m]))
+          ) > 
+          (
+            sum(rate(http_requests_total{version="stable",status=~"5.."}[5m])) /
+            sum(rate(http_requests_total{version="stable"}[5m]))
+          ) * 2
+        for: 2m
+        labels:
+          severity: critical
+          team: deployment
+        annotations:
+          summary: "Canary deployment showing 2x error rate vs stable"
+          description: "Canary errors significantly higher than stable version."
+          action: "ROLLBACK deployment immediately. Investigate before retry."
+
+      # Canary latency higher than stable
+      - alert: CanaryLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            rate(http_request_duration_seconds_bucket{version="canary"}[5m])
+          ) >
+          histogram_quantile(0.95,
+            rate(http_request_duration_seconds_bucket{version="stable"}[5m])
+          ) * 1.5
+        for: 2m
+        labels:
+          severity: critical
+          team: deployment
+        annotations:
+          summary: "Canary deployment showing 1.5x latency vs stable"
+          description: "Canary P95 latency significantly higher than stable version."
+          action: "ROLLBACK deployment. Check for performance regressions."

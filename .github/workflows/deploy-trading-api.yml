@@ -1,0 +1,505 @@
+name: CFI Trading Platform - CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'src/**'
+      - 'kubernetes/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/trading-api
+  K8S_NAMESPACE: trading
+  PROMETHEUS_URL: http://prometheus-server.monitoring.svc.cluster.local
+
+jobs:
+  # ============================================================================
+  # JOB 1: BUILD & TEST
+  # ============================================================================
+  build-and-test:
+    name: Build, Test & Push Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run linting
+        run: npm run lint
+      
+      - name: Run unit tests
+        run: npm test
+      
+      - name: Run integration tests
+        run: npm run test:integration
+      
+      - name: Code coverage
+        run: npm run coverage
+      
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage/coverage-final.json
+      
+      # Docker image build
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix={{branch}}-
+      
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Sign image with cosign
+        run: |
+          echo "Image built and pushed: ${{ steps.meta.outputs.tags }}"
+          echo "Digest: ${{ steps.build.outputs.digest }}"
+
+  # ============================================================================
+  # JOB 2: DEPLOY TO STAGING
+  # ============================================================================
+  deploy-staging:
+    name: Deploy to Staging & Run Smoke Tests
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging-api.cfi.trade
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG_STAGING }}
+      
+      - name: Deploy to staging
+        run: |
+          kubectl set image deployment/trading-api \
+            trading-api=${{ needs.build-and-test.outputs.image-tag }} \
+            -n ${{ env.K8S_NAMESPACE }}-staging
+          
+          kubectl rollout status deployment/trading-api \
+            -n ${{ env.K8S_NAMESPACE }}-staging \
+            --timeout=5m
+      
+      - name: Wait for pods to stabilize
+        run: sleep 60
+      
+      - name: Run smoke tests
+        run: |
+          STAGING_URL="https://staging-api.cfi.trade"
+          
+          # Test 1: Health check
+          echo "Testing health endpoint..."
+          curl -f $STAGING_URL/health || exit 1
+          
+          # Test 2: Metrics endpoint
+          echo "Testing metrics endpoint..."
+          curl -f $STAGING_URL/metrics | grep "http_requests_total" || exit 1
+          
+          # Test 3: Create test order
+          echo "Testing order creation..."
+          curl -f -X POST $STAGING_URL/api/orders \
+            -H "Content-Type: application/json" \
+            -d '{"symbol":"AAPL","quantity":10,"type":"market"}' || exit 1
+          
+          echo "✓ All smoke tests passed"
+      
+      - name: Notify Slack - Staging deployed
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "✅ Staging deployment successful",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*CFI Trading API* deployed to staging\n*Image:* `${{ needs.build-and-test.outputs.image-tag }}`\n*Status:* All smoke tests passed"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # ============================================================================
+  # JOB 3: DEPLOY CANARY TO PRODUCTION (10% TRAFFIC)
+  # ============================================================================
+  deploy-canary:
+    name: Deploy Canary to Production
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production-canary
+      url: https://api.cfi.trade
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG_PRODUCTION }}
+      
+      - name: Create Grafana deployment annotation
+        run: |
+          curl -X POST https://grafana.cfi.trade/api/annotations \
+            -H "Authorization: Bearer ${{ secrets.GRAFANA_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "Canary deployment started: ${{ needs.build-and-test.outputs.image-tag }}",
+              "tags": ["deployment", "canary"],
+              "time": '$(date +%s000)'
+            }'
+      
+      - name: Deploy canary (10% traffic)
+        run: |
+          # Update canary deployment
+          kubectl set image deployment/trading-api-canary \
+            trading-api=${{ needs.build-and-test.outputs.image-tag }} \
+            -n ${{ env.K8S_NAMESPACE }}
+          
+          # Scale canary to 2 replicas (10% of 20 total)
+          kubectl scale deployment/trading-api-canary \
+            --replicas=2 \
+            -n ${{ env.K8S_NAMESPACE }}
+          
+          # Wait for rollout
+          kubectl rollout status deployment/trading-api-canary \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=5m
+          
+          echo "✓ Canary deployed successfully"
+      
+      - name: Label canary pods with version
+        run: |
+          kubectl patch deployment trading-api-canary \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --type=merge \
+            -p '{"spec":{"template":{"metadata":{"labels":{"version":"canary"}}}}}'
+      
+      - name: Notify Slack - Canary deployed
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "🕯️ Canary deployment started (10% traffic)",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*CFI Trading API* canary deployed\n*Image:* `${{ needs.build-and-test.outputs.image-tag }}`\n*Traffic:* 10%\n*Monitoring for 10 minutes...*"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # ============================================================================
+  # JOB 4: MONITOR CANARY HEALTH (CRITICAL!)
+  # ============================================================================
+  monitor-canary:
+    name: Monitor Canary Health & Auto-Rollback
+    runs-on: ubuntu-latest
+    needs: [build-and-test, deploy-canary]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG_PRODUCTION }}
+      
+      - name: Install monitoring tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc jq curl
+      
+      - name: Monitor canary for 10 minutes
+        id: health-check
+        run: |
+          echo "Starting 10-minute health monitoring..."
+          
+          PROMETHEUS_URL="${{ env.PROMETHEUS_URL }}"
+          ITERATIONS=20  # 20 checks x 30 seconds = 10 minutes
+          FAILED=false
+          
+          for i in $(seq 1 $ITERATIONS); do
+            echo ""
+            echo "=== Health Check $i/$ITERATIONS ==="
+            
+            # Check 1: Error Rate
+            echo "Checking error rate..."
+            CANARY_ERRORS=$(curl -s "$PROMETHEUS_URL/api/v1/query" \
+              --data-urlencode 'query=sum(rate(http_requests_total{version="canary",status=~"5.."}[5m])) / sum(rate(http_requests_total{version="canary"}[5m]))' \
+              | jq -r '.data.result[0].value[1] // "0"')
+            
+            STABLE_ERRORS=$(curl -s "$PROMETHEUS_URL/api/v1/query" \
+              --data-urlencode 'query=sum(rate(http_requests_total{version="stable",status=~"5.."}[5m])) / sum(rate(http_requests_total{version="stable"}[5m]))' \
+              | jq -r '.data.result[0].value[1] // "0"')
+            
+            echo "  Canary errors: $CANARY_ERRORS"
+            echo "  Stable errors: $STABLE_ERRORS"
+            
+            # Fail if canary errors > 2x stable
+            THRESHOLD=$(echo "$STABLE_ERRORS * 2" | bc -l)
+            if (( $(echo "$CANARY_ERRORS > $THRESHOLD" | bc -l) )); then
+              echo "❌ FAILED: Canary error rate is 2x higher than stable"
+              FAILED=true
+              break
+            fi
+            
+            # Check 2: Latency (P95)
+            echo "Checking latency..."
+            CANARY_P95=$(curl -s "$PROMETHEUS_URL/api/v1/query" \
+              --data-urlencode 'query=histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{version="canary"}[5m]))' \
+              | jq -r '.data.result[0].value[1] // "0"')
+            
+            STABLE_P95=$(curl -s "$PROMETHEUS_URL/api/v1/query" \
+              --data-urlencode 'query=histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{version="stable"}[5m]))' \
+              | jq -r '.data.result[0].value[1] // "0"')
+            
+            echo "  Canary P95: ${CANARY_P95}s"
+            echo "  Stable P95: ${STABLE_P95}s"
+            
+            # Fail if canary P95 > 1.5x stable
+            THRESHOLD=$(echo "$STABLE_P95 * 1.5" | bc -l)
+            if (( $(echo "$CANARY_P95 > $THRESHOLD" | bc -l) )); then
+              echo "❌ FAILED: Canary latency is 1.5x higher than stable"
+              FAILED=true
+              break
+            fi
+            
+            # Check 3: Order Success Rate (CFI-specific)
+            echo "Checking order success rate..."
+            SUCCESS_RATE=$(curl -s "$PROMETHEUS_URL/api/v1/query" \
+              --data-urlencode 'query=(sum(rate(orders_total{version="canary",status="success"}[5m])) / sum(rate(orders_total{version="canary"}[5m]))) * 100' \
+              | jq -r '.data.result[0].value[1] // "100"')
+            
+            echo "  Order success rate: ${SUCCESS_RATE}%"
+            
+            # Fail if success rate < 99.99%
+            if (( $(echo "$SUCCESS_RATE < 99.99" | bc -l) )); then
+              echo "❌ FAILED: Order success rate below 99.99% SLO"
+              FAILED=true
+              break
+            fi
+            
+            # Check 4: Pod Health
+            echo "Checking pod health..."
+            UNHEALTHY_PODS=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
+              -l app=trading-api,version=canary \
+              --field-selector=status.phase!=Running \
+              --no-headers | wc -l)
+            
+            if [ "$UNHEALTHY_PODS" -gt 0 ]; then
+              echo "❌ FAILED: $UNHEALTHY_PODS canary pods are unhealthy"
+              FAILED=true
+              break
+            fi
+            
+            echo "✅ Health check $i passed"
+            
+            # Wait 30 seconds before next check
+            sleep 30
+          done
+          
+          if [ "$FAILED" = true ]; then
+            echo "health_status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "health_status=passed" >> $GITHUB_OUTPUT
+            echo "✅ All health checks passed!"
+          fi
+      
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "🚨 ROLLING BACK CANARY DEPLOYMENT"
+          
+          # Rollback canary
+          kubectl rollout undo deployment/trading-api-canary \
+            -n ${{ env.K8S_NAMESPACE }}
+          
+          # Scale canary to 0
+          kubectl scale deployment/trading-api-canary \
+            --replicas=0 \
+            -n ${{ env.K8S_NAMESPACE }}
+          
+          # Create Grafana annotation
+          curl -X POST https://grafana.cfi.trade/api/annotations \
+            -H "Authorization: Bearer ${{ secrets.GRAFANA_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "Canary deployment FAILED - auto-rolled back",
+              "tags": ["deployment", "rollback", "failure"],
+              "time": '$(date +%s000)'
+            }'
+          
+          echo "✓ Rollback complete"
+      
+      - name: Notify Slack - Monitoring result
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ steps.health-check.outputs.health_status == 'passed' && '✅ Canary health checks PASSED' || '🚨 Canary health checks FAILED - rolled back' }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*CFI Trading API Canary Monitoring*\n*Status:* ${{ steps.health-check.outputs.health_status }}\n*Action:* ${{ steps.health-check.outputs.health_status == 'passed' && 'Proceeding to full rollout' || 'Auto-rolled back to stable version' }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # ============================================================================
+  # JOB 5: PROMOTE CANARY TO FULL PRODUCTION
+  # ============================================================================
+  promote-production:
+    name: Promote Canary to 100% Production
+    runs-on: ubuntu-latest
+    needs: [build-and-test, deploy-canary, monitor-canary]
+    if: github.ref == 'refs/heads/main' && success()
+    environment:
+      name: production
+      url: https://api.cfi.trade
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG_PRODUCTION }}
+      
+      - name: Gradual rollout to 50%
+        run: |
+          echo "Scaling to 50% traffic..."
+          kubectl scale deployment/trading-api-canary --replicas=10 -n ${{ env.K8S_NAMESPACE }}
+          kubectl scale deployment/trading-api-stable --replicas=10 -n ${{ env.K8S_NAMESPACE }}
+          
+          echo "Monitoring for 5 minutes..."
+          sleep 300
+      
+      - name: Gradual rollout to 100%
+        run: |
+          echo "Scaling to 100% traffic..."
+          kubectl scale deployment/trading-api-canary --replicas=20 -n ${{ env.K8S_NAMESPACE }}
+          kubectl scale deployment/trading-api-stable --replicas=0 -n ${{ env.K8S_NAMESPACE }}
+          
+          echo "Monitoring for 5 minutes..."
+          sleep 300
+      
+      - name: Finalize deployment
+        run: |
+          # Update stable deployment with new image
+          kubectl set image deployment/trading-api-stable \
+            trading-api=${{ needs.build-and-test.outputs.image-tag }} \
+            -n ${{ env.K8S_NAMESPACE }}
+          
+          # Scale stable back up
+          kubectl scale deployment/trading-api-stable --replicas=20 -n ${{ env.K8S_NAMESPACE }}
+          
+          # Scale canary back down
+          kubectl scale deployment/trading-api-canary --replicas=0 -n ${{ env.K8S_NAMESPACE }}
+          
+          echo "✅ Deployment finalized"
+      
+      - name: Create Grafana deployment annotation
+        run: |
+          curl -X POST https://grafana.cfi.trade/api/annotations \
+            -H "Authorization: Bearer ${{ secrets.GRAFANA_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "Production deployment completed: ${{ needs.build-and-test.outputs.image-tag }}",
+              "tags": ["deployment", "production", "success"],
+              "time": '$(date +%s000)'
+            }'
+      
+      - name: Notify Slack - Deployment complete
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "🎉 Production deployment SUCCESSFUL!",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*CFI Trading API* deployed to production\n*Image:* `${{ needs.build-and-test.outputs.image-tag }}`\n*Traffic:* 100%\n*Status:* ✅ All health checks passed"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

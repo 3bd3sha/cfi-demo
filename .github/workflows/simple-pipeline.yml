@@ -1,0 +1,181 @@
+name: Simple CI/CD Practice Pipeline
+
+# This is a simplified version you can actually run and test locally
+# Perfect for demonstrating CI/CD concepts in interviews
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  IMAGE_NAME: trading-api
+  K8S_NAMESPACE: trading
+
+jobs:
+  # ==========================================================================
+  # STAGE 1: BUILD & TEST
+  # ==========================================================================
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+      
+      - name: 🏗️ Build Docker image
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          echo "✅ Image built successfully"
+      
+      - name: 🧪 Run tests inside container
+        run: |
+          docker run --rm ${{ env.IMAGE_NAME }}:${{ github.sha }} npm test
+          echo "✅ Tests passed"
+      
+      - name: 🔍 Security scan
+        run: |
+          # Using trivy for vulnerability scanning
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy image \
+            --severity HIGH,CRITICAL \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+      
+      - name: 📤 Save image (for next job)
+        run: |
+          docker save ${{ env.IMAGE_NAME }}:${{ github.sha }} > image.tar
+      
+      - name: 📦 Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: docker-image
+          path: image.tar
+
+  # ==========================================================================
+  # STAGE 2: DEPLOY TO STAGING
+  # ==========================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: 📥 Download image
+        uses: actions/download-artifact@v3
+        with:
+          name: docker-image
+      
+      - name: 🔄 Load image
+        run: docker load < image.tar
+      
+      - name: 🚀 Deploy to staging
+        run: |
+          echo "Deploying to staging environment..."
+          # kubectl set image deployment/${{ env.IMAGE_NAME }} ...
+          echo "✅ Deployed to staging"
+      
+      - name: 🧪 Run smoke tests
+        run: |
+          echo "Running smoke tests..."
+          # curl -f https://staging.api.cfi.trade/health
+          echo "✅ Smoke tests passed"
+
+  # ==========================================================================
+  # STAGE 3: DEPLOY CANARY TO PRODUCTION
+  # ==========================================================================
+  deploy-canary:
+    name: Deploy Canary (10%)
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+      
+      - name: 📥 Download image
+        uses: actions/download-artifact@v3
+        with:
+          name: docker-image
+      
+      - name: 🔄 Load image
+        run: docker load < image.tar
+      
+      - name: 🕯️ Deploy canary
+        run: |
+          echo "Deploying canary (10% traffic)..."
+          # kubectl set image deployment/${{ env.IMAGE_NAME }}-canary ...
+          # kubectl scale deployment/${{ env.IMAGE_NAME }}-canary --replicas=2
+          echo "✅ Canary deployed"
+
+  # ==========================================================================
+  # STAGE 4: MONITOR CANARY
+  # ==========================================================================
+  monitor-canary:
+    name: Monitor Canary Health
+    runs-on: ubuntu-latest
+    needs: deploy-canary
+    
+    steps:
+      - name: 📊 Check Prometheus metrics
+        run: |
+          echo "Monitoring canary for 10 minutes..."
+          
+          # Simulate 20 health checks (20 x 30s = 10 minutes)
+          for i in {1..20}; do
+            echo "Health check $i/20..."
+            
+            # In real scenario, query Prometheus:
+            # curl prometheus:9090/api/v1/query?query=...
+            
+            # Check error rate
+            # Check latency
+            # Check success rate
+            
+            sleep 2  # Shortened for demo (real: 30 seconds)
+          done
+          
+          echo "✅ All health checks passed"
+      
+      - name: ❌ Rollback on failure
+        if: failure()
+        run: |
+          echo "🚨 Health checks failed - rolling back..."
+          # kubectl rollout undo deployment/${{ env.IMAGE_NAME }}-canary
+          echo "✅ Rolled back to stable version"
+
+  # ==========================================================================
+  # STAGE 5: PROMOTE TO PRODUCTION
+  # ==========================================================================
+  promote-production:
+    name: Promote to 100%
+    runs-on: ubuntu-latest
+    needs: monitor-canary
+    if: success()
+    
+    steps:
+      - name: 🚀 Scale to 50%
+        run: |
+          echo "Scaling canary to 50%..."
+          # kubectl scale deployment/${{ env.IMAGE_NAME }}-canary --replicas=10
+          sleep 5  # Monitor for 5 min in real scenario
+          echo "✅ 50% healthy"
+      
+      - name: 🚀 Scale to 100%
+        run: |
+          echo "Scaling canary to 100%..."
+          # kubectl scale deployment/${{ env.IMAGE_NAME }}-canary --replicas=20
+          # kubectl scale deployment/${{ env.IMAGE_NAME }}-stable --replicas=0
+          sleep 5
+          echo "✅ 100% deployed"
+      
+      - name: 🎉 Finalize
+        run: |
+          echo "Finalizing deployment..."
+          # kubectl set image deployment/${{ env.IMAGE_NAME }}-stable ...
+          echo "✅ Deployment complete!"
+          echo "📊 View metrics: https://grafana.cfi.trade"

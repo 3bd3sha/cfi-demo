@@ -1,0 +1,177 @@
+# Prometheus Configuration for CFI Trading Platform
+# Docker Compose version - monitors local containers
+
+global:
+  scrape_interval: 15s      # Scrape targets every 15 seconds
+  evaluation_interval: 15s   # Evaluate rules every 15 seconds
+  external_labels:
+    cluster: 'cfi-local'
+    environment: 'dev'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+# Load alert rules
+rule_files:
+  - "alert_rules.yml"
+
+# Scrape configurations
+scrape_configs:
+  
+  # ==========================================================================
+  # DOCKER COMPOSE SERVICES
+  # ==========================================================================
+  
+  # Sample Trading App - Stable
+  - job_name: 'trading-api-stable'
+    static_configs:
+      - targets: ['sample-app:8000']
+        labels:
+          version: 'stable'
+          service: 'trading-api'
+  
+  # Sample Trading App - Canary (when running)
+  - job_name: 'trading-api-canary'
+    static_configs:
+      - targets: ['trading-api-canary:8080']
+        labels:
+          version: 'canary'
+          service: 'trading-api'
+  
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+  
+  # Alertmanager
+  - job_name: 'alertmanager'
+    static_configs:
+      - targets: ['alertmanager:9093']
+  
+  # ==========================================================================
+  # KUBERNETES SERVICES (commented out for Docker Compose)
+  # ==========================================================================
+  # ============================================================================
+  # TRADING SERVICES
+  # ============================================================================
+  
+  # Order Execution Service
+  - job_name: 'trading-api'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - trading
+    relabel_configs:
+      # Only scrape pods with prometheus.io/scrape annotation
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      # Use custom port if specified
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        target_label: __address__
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+      # Add pod name as label
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      # Add namespace as label
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      # Add service name
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        target_label: app
+
+  # Market Data Feed Service
+  - job_name: 'market-data'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - trading
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: market-data
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+
+  # Payment Processing Service
+  - job_name: 'payment-service'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - trading
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: payment-service
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+
+  # ============================================================================
+  # INFRASTRUCTURE MONITORING
+  # ============================================================================
+  
+  # Node Exporter (host metrics)
+  - job_name: 'node-exporter'
+    kubernetes_sd_configs:
+      - role: node
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '(.*):10250'
+        replacement: '${1}:9100'
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: node
+
+  # cAdvisor (container metrics)
+  - job_name: 'cadvisor'
+    kubernetes_sd_configs:
+      - role: node
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    relabel_configs:
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+
+  # Kube State Metrics (Kubernetes objects)
+  - job_name: 'kube-state-metrics'
+    static_configs:
+      - targets:
+          - kube-state-metrics.kube-system.svc.cluster.local:8080
+
+  # ============================================================================
+  # PROMETHEUS SELF-MONITORING
+  # ============================================================================
+  
+  - job_name: 'prometheus'
+    static_configs:
+      - targets:
+          - localhost:9090
+
+  # Alertmanager
+  - job_name: 'alertmanager'
+    static_configs:
+      - targets:
+          - alertmanager:9093
+
+  # Grafana
+  - job_name: 'grafana'
+    static_configs:
+      - targets:
+          - grafana:3000
